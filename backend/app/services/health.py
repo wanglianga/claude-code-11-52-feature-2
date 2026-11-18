@@ -17,6 +17,7 @@ from ..models import (
     Source,
 )
 from ..timeutil import SLOT, iso, slots_between, utcnow
+from . import semantics
 
 
 # ---------------------------------------------------------------- commitments
@@ -545,7 +546,11 @@ def evaluate_window(
     persist: bool = True,
 ) -> HealthEvaluation | dict[str, Any]:
     meters = (
-        db.execute(select(Meter).where(Meter.source_id == source.id).order_by(Meter.code))
+        db.execute(
+            select(Meter)
+            .where(Meter.source_id == source.id, Meter.status == "active")
+            .order_by(Meter.code)
+        )
         .scalars()
         .all()
     )
@@ -579,6 +584,12 @@ def evaluate_window(
     else:
         status = "healthy"
 
+    # 语义契约闸门：存在原始受理时编译标准事实/待核隔离；待核槽位不填零并阻断确认版。
+    # 无原始受理的来源保持既有 Sample 链路结论不变。
+    semantic = semantics.semantic_gate(db, source, ws, we, cutoff)
+    semantic_blocked = bool(semantic and semantic["semantic_blocked"])
+    contract_release_version = semantic["contract_release_version"] if semantic else None
+
     certified = bool(
         complete
         and punctual
@@ -586,9 +597,15 @@ def evaluate_window(
         and cutoff >= we
         and coverage_den > 0
         and scheduled_den == coverage_den
+        and not semantic_blocked
     )
     confirmable = bool(
-        complete and punctual and verification_ok and cutoff >= we and scheduled_den == coverage_den
+        complete
+        and punctual
+        and verification_ok
+        and cutoff >= we
+        and scheduled_den == coverage_den
+        and not semantic_blocked
     )
     if pending:
         freshness = "lagging"
@@ -647,7 +664,10 @@ def evaluate_window(
             "duplicates": sum(m["duplicate_slots"] for m in meter_results),
             "declared_zero": sum(m["declared_zero_slots"] for m in meter_results),
             "beyond_cutoff": len(beyond),
+            "quarantined": semantic["quarantined_count"] if semantic else 0,
+            "standard_facts": semantic["standard_count"] if semantic else 0,
         },
+        "semantic": semantic,
         "meters": meter_results,
         "missing": missing,
         "pending": pending,
@@ -674,6 +694,7 @@ def evaluate_window(
         latest.certified = certified
         latest.confirmable = confirmable
         latest.max_lateness_minutes = round(max_lateness)
+        latest.contract_release_version = contract_release_version
         db.flush()
         ev = latest
     else:
@@ -693,6 +714,7 @@ def evaluate_window(
             certified=certified,
             confirmable=confirmable,
             max_lateness_minutes=round(max_lateness),
+            contract_release_version=contract_release_version,
             details=payload,
         )
         db.add(ev)

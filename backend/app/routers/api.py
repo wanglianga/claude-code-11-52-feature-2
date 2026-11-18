@@ -18,16 +18,21 @@ from ..models import (
     Consumer,
     ConsumerDependency,
     ConsumerImpact,
+    ContractRelease,
     HealthEvaluation,
     Incident,
     MaintenanceWindow,
     Meter,
     MeterCommitment,
     ProductRun,
+    QuarantineRecord,
+    RawReading,
     RecoveryCheck,
     Sample,
+    SemanticContract,
     SimClock,
     Source,
+    StandardIntervalFact,
     User,
 )
 from ..services import simulator
@@ -1087,3 +1092,305 @@ def reset_acceptance(db: Session = Depends(get_db)) -> dict[str, Any]:
     reset_demo_state(db)
     clock = get_clock(db)
     return {"ok": True, "now": iso(clock.now), "day": clock.day}
+
+
+# ------------------------------------------------------------------ semantics
+
+
+def _meter_or_404(db: Session, code: str) -> Meter:
+    meter = db.execute(select(Meter).where(Meter.code == code)).scalars().first()
+    if meter is None:
+        raise HTTPException(404, f"表计不存在: {code}")
+    return meter
+
+
+@router.get("/semantics/units", tags=["semantics"])
+def semantic_units() -> dict[str, Any]:
+    from ..services.semantics import STANDARD_DIMENSION, UNIT_REGISTRY
+
+    return {
+        "units": UNIT_REGISTRY,
+        "standard_dimensions": STANDARD_DIMENSION,
+        "semantics_values": ["cumulative", "interval", "instant"],
+    }
+
+
+@router.get("/semantics/contracts", tags=["semantics"])
+def list_contracts(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = (
+        db.execute(select(SemanticContract).order_by(SemanticContract.meter_id, SemanticContract.valid_from))
+        .scalars()
+        .all()
+    )
+    out = []
+    for c in rows:
+        meter = db.get(Meter, c.meter_id)
+        out.append(
+            {
+                "id": c.id,
+                "code": c.code,
+                "meter_code": meter.code if meter else None,
+                "meter_name": meter.name if meter else None,
+                "source_code": c.source_code,
+                "source_version": c.source_version,
+                "measurement_object": c.measurement_object,
+                "physical_quantity": c.physical_quantity,
+                "raw_unit": c.raw_unit,
+                "standard_unit": c.standard_unit,
+                "reading_semantics": c.reading_semantics,
+                "representative_minutes": c.representative_minutes,
+                "sign_direction": c.sign_direction,
+                "feedback_meaning": c.feedback_meaning,
+                "multiplier_ref": c.multiplier_ref,
+                "multiplier_factor": c.multiplier_factor,
+                "unit_factor": c.unit_factor,
+                "unit_factor_evidence": c.unit_factor_evidence,
+                "valid_from": iso(c.valid_from),
+                "valid_to": iso(c.valid_to),
+                "status": c.status,
+                "note": c.note,
+            }
+        )
+    return out
+
+
+@router.post("/semantics/contracts", tags=["semantics"])
+def create_contract(body: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services import semantics
+
+    meter = _meter_or_404(db, body["meter"])
+    try:
+        contract = semantics.register_contract(
+            db,
+            meter,
+            source_code=body.get("source_code", "manual"),
+            source_version=body["source_version"],
+            measurement_object=body.get("measurement_object", meter.name),
+            physical_quantity=body["physical_quantity"],
+            raw_unit=body["raw_unit"],
+            standard_unit=body.get("standard_unit"),
+            reading_semantics=body["reading_semantics"],
+            representative_minutes=int(body.get("representative_minutes", 15)),
+            sign_direction=body.get("sign_direction", "forward"),
+            feedback_meaning=body.get("feedback_meaning", ""),
+            multiplier_ref=body.get("multiplier_ref", "meter.multiplier"),
+            multiplier_factor=float(body.get("multiplier_factor", 1.0)),
+            unit_factor=(float(body["unit_factor"]) if body.get("unit_factor") is not None else None),
+            unit_factor_evidence=body.get("unit_factor_evidence", ""),
+            valid_from=_parse_dt(body["valid_from"], "生效时间"),
+            valid_to=_parse_dt(body["valid_to"], "失效时间") if body.get("valid_to") else None,
+            note=body.get("note", ""),
+            allow_overlap=bool(body.get("allow_overlap", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.commit()
+    return {"ok": True, "contract_id": contract.id, "code": contract.code}
+
+
+@router.get("/semantics/releases", tags=["semantics"])
+def list_releases(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.execute(select(ContractRelease).order_by(ContractRelease.version)).scalars().all()
+    return [
+        {
+            "version": r.version,
+            "status": r.status,
+            "contract_count": len(r.contract_ids or []),
+            "fingerprint": r.fingerprint,
+            "note": r.note,
+            "created_at": iso(r.created_at),
+        }
+        for r in rows
+    ]
+
+
+@router.post("/semantics/release", tags=["semantics"])
+def lock_release(db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services import semantics
+
+    release = semantics.ensure_release(db)
+    db.commit()
+    return {"ok": True, "version": release.version, "fingerprint": release.fingerprint}
+
+
+@router.get("/semantics/raw", tags=["semantics"])
+def list_raw(
+    db: Session = Depends(get_db), meter: str | None = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    stmt = select(RawReading).order_by(RawReading.slot_start.desc(), RawReading.id.desc()).limit(limit)
+    if meter:
+        m = _meter_or_404(db, meter)
+        stmt = stmt.where(RawReading.meter_id == m.id)
+    rows = db.execute(stmt).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "meter_id": r.meter_id,
+            "slot_start": iso(r.slot_start),
+            "slot_end": iso(r.slot_end),
+            "raw_value": r.raw_value,
+            "raw_unit": r.raw_unit,
+            "source_code": r.source_code,
+            "source_version": r.source_version,
+            "received_at": iso(r.received_at),
+            "numeric_parseable": (r.payload or {}).get("numeric_parseable", True),
+        }
+        for r in rows
+    ]
+
+
+@router.post("/semantics/raw", tags=["semantics"])
+def create_raw(body: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services import semantics
+
+    meter = _meter_or_404(db, body["meter"])
+    # 平台以模拟时钟为准：未显式给出受理时间时，与样本到达链路一致取当前模拟时间，
+    # 否则真实时间会晚于模拟截止点而在编译时被过滤
+    received_at = (
+        _parse_dt(body["received_at"], "受理时间")
+        if body.get("received_at")
+        else simulator.get_clock(db).now
+    )
+    reading = semantics.ingest_raw_reading(
+        db,
+        meter,
+        _parse_dt(body["slot_start"], "槽位开始"),
+        body.get("raw_value"),
+        raw_unit=body.get("raw_unit", ""),
+        source_code=body.get("source_code", "manual"),
+        source_version=body["source_version"],
+        received_at=received_at,
+        slot_minutes=int(body.get("slot_minutes", 15)),
+        payload=body.get("payload") or {},
+    )
+    db.commit()
+    return {"ok": True, "raw_reading_id": reading.id, "numeric_parseable": (reading.payload or {}).get("numeric_parseable", True)}
+
+
+@router.get("/semantics/facts", tags=["semantics"])
+def get_facts(
+    db: Session = Depends(get_db),
+    source: str = Query(...),
+    window_start: str = Query(...),
+    window_end: str | None = None,
+    release_version: int | None = None,
+) -> dict[str, Any]:
+    from ..services import semantics
+
+    src = db.execute(select(Source).where(Source.code == source)).scalars().first()
+    if src is None:
+        raise HTTPException(404, "数据来源不存在")
+    ws = _parse_dt(window_start, "窗口开始")
+    we = _parse_dt(window_end, "窗口结束") if window_end else ws + WINDOW
+    facts = semantics.standard_facts_for_window(db, src.id, ws, we, release_version)
+    return {
+        "source": source,
+        "window_start": iso(ws),
+        "window_end": iso(we),
+        "release_version": release_version,
+        "facts": [
+            {
+                "id": f.id,
+                "meter_id": f.meter_id,
+                "building_code": f.building_code,
+                "slot": iso(f.slot_start),
+                "slot_end": iso(f.slot_end),
+                "physical_quantity": f.physical_quantity,
+                "standard_unit": f.standard_unit,
+                "standard_value": f.standard_value,
+                "source_semantics": f.source_semantics,
+                "boundary_split": f.boundary_split,
+                "contract_release_version": f.contract_release_version,
+                "conversion_steps": f.conversion_steps,
+            }
+            for f in facts
+        ],
+    }
+
+
+@router.get("/semantics/quarantine", tags=["semantics"])
+def get_quarantine(
+    db: Session = Depends(get_db),
+    source: str = Query(...),
+    window_start: str = Query(...),
+    window_end: str | None = None,
+    release_version: int | None = None,
+) -> dict[str, Any]:
+    from ..services import semantics
+
+    src = db.execute(select(Source).where(Source.code == source)).scalars().first()
+    if src is None:
+        raise HTTPException(404, "数据来源不存在")
+    ws = _parse_dt(window_start, "窗口开始")
+    we = _parse_dt(window_end, "窗口结束") if window_end else ws + WINDOW
+    rows = semantics.quarantine_for_window(db, src.id, ws, we, release_version)
+    return {
+        "source": source,
+        "window_start": iso(ws),
+        "window_end": iso(we),
+        "quarantined": [
+            {
+                "id": q.id,
+                "meter_id": q.meter_id,
+                "building_code": q.building_code,
+                "slot": iso(q.slot_start),
+                "slot_end": iso(q.slot_end),
+                "physical_quantity": q.physical_quantity,
+                "reason_code": q.reason_code,
+                "reason_detail": q.reason_detail,
+                "numeric_parseable": q.numeric_parseable,
+                "status": q.status,
+                "contract_ids": q.contract_ids,
+                "contract_release_version": q.contract_release_version,
+            }
+            for q in rows
+        ],
+    }
+
+
+@router.post("/semantics/compile", tags=["semantics"])
+def compile_window_endpoint(body: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services import semantics
+
+    src = db.execute(select(Source).where(Source.code == body["source"])).scalars().first()
+    if src is None:
+        raise HTTPException(404, "数据来源不存在")
+    ws = _parse_dt(body["window_start"], "窗口开始")
+    we = _parse_dt(body["window_end"], "窗口结束") if body.get("window_end") else ws + WINDOW
+    cutoff = _parse_dt(body["cutoff"], "截止点") if body.get("cutoff") else simulator.get_clock(db).now
+    result = semantics.compile_window(db, src, ws, we, cutoff)
+    db.commit()
+    return {"ok": True, **result}
+
+
+@router.post("/semantics/replay", tags=["semantics"])
+def replay_endpoint(body: dict[str, Any] | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """契约更正后重放受影响历史；新版本只影响新编译，历史版本产物保留可复演。"""
+    from ..services import semantics
+
+    body = body or {}
+    meter = None
+    if body.get("meter"):
+        meter = _meter_or_404(db, body["meter"])
+    since = _parse_dt(body["since"], "重放起点") if body.get("since") else None
+    result = semantics.replay(db, meter_id=meter.id if meter else None, since=since)
+    db.commit()
+    return {"ok": True, **result}
+
+
+@router.post("/semantics/acceptance/run", tags=["semantics"])
+def semantic_acceptance_run(db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services.semantic_demo import run_semantic_acceptance
+
+    result = run_semantic_acceptance(db)
+    db.commit()
+    return result
+
+
+@router.post("/semantics/acceptance/reset", tags=["semantics"])
+def semantic_acceptance_reset(db: Session = Depends(get_db)) -> dict[str, Any]:
+    from ..services.semantic_demo import reset_semantic_demo
+
+    reset_semantic_demo(db)
+    db.commit()
+    return {"ok": True}

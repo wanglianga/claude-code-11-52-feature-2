@@ -57,6 +57,7 @@ const pages = [
   ['impact', (await import('../src/pages/Impact')).default, ['消费影响地图', '阈值敏感性', '物业调度大屏', '月度结算账单']],
   ['incidents', (await import('../src/pages/Incidents')).default, ['事故指挥', '事故列表', '处置动作', 'INC-']],
   ['simulator', (await import('../src/pages/Simulator')).default, ['模拟与验收', '审计时间线', '样本到达']],
+  ['semantics', (await import('../src/pages/Semantics')).default, ['语义契约治理', '语义契约登记', '解释版本谱系', '重放语义验收']],
   ['acceptance', (await import('../src/pages/Acceptance')).default, ['验收报告', '重放验收场景']],
 ] as const
 
@@ -95,6 +96,28 @@ for (const [name, Page, needles] of pages) {
     const text = container.textContent || ''
     checks += 1
     if (!text.includes('预览阈值')) failures.push('impact: preview result did not render')
+  }
+  unmount()
+  cleanup()
+}
+
+// Interaction: semantic acceptance replay must compile standard facts and quarantined slots.
+{
+  const Semantics = (await import('../src/pages/Semantics')).default
+  const { container, unmount } = render(
+    React.createElement(AppProvider, null, React.createElement(MemoryRouter, null, React.createElement(Semantics as any))),
+  )
+  await new Promise((r) => setTimeout(r, 1200))
+  const btn = Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.includes('重放语义验收'))
+  if (!btn) failures.push('semantics: replay button missing')
+  else {
+    btn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 2600))
+    const text = container.textContent || ''
+    for (const needle of ['编译总览', '标准区间事实', '待核隔离', '量纲不兼容']) {
+      checks += 1
+      if (!text.includes(needle)) failures.push(`semantics: missing "${needle}" after replay`)
+    }
   }
   unmount()
   cleanup()

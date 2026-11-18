@@ -39,6 +39,7 @@ app = FastAPI(
         {"name": "impact", "description": "消费目录与按消费者阈值的独立影响判定"},
         {"name": "incidents", "description": "事故指挥：区间、证据、恢复评估、关闭与重开"},
         {"name": "simulator", "description": "模拟表计到达、时钟推进与审计时间线"},
+        {"name": "semantics", "description": "表计数据语义契约：登记/发布/锁定、原始受理、标准区间事实、待核隔离与更正重放"},
         {"name": "acceptance", "description": "验收场景重放与报告"},
     ],
 )

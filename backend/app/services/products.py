@@ -168,6 +168,17 @@ def build_product(
     slot_map = _slot_status(evaluation)
     qualified, excused = _classify(slot_map)
     output = _product_output(db, source, evaluation, ws, we, cutoff)
+    # 产品固定引用语义契约解释版本；所有消费者必须引用同一解释版本
+    output["contract_release_version"] = evaluation.contract_release_version
+    semantic_detail = (evaluation.details or {}).get("semantic")
+    if semantic_detail:
+        output["semantic"] = {
+            "contract_release_version": semantic_detail["contract_release_version"],
+            "standard_count": semantic_detail["standard_count"],
+            "quarantined_count": semantic_detail["quarantined_count"],
+            "semantic_blocked": semantic_detail["semantic_blocked"],
+            "quarantine_reasons": semantic_detail["quarantine_reasons"],
+        }
 
     details = evaluation.details or {}
     if product_code == PRODUCT_DAILY:
@@ -226,6 +237,7 @@ def build_product(
                 {**r, "kind": "qualified"} for r in qualified
             ] + [{**r, "kind": "maintenance"} for r in excused]
             latest.evaluation_ids = [evaluation.id]
+            latest.contract_release_version = evaluation.contract_release_version
             db.flush()
             return latest
 
@@ -240,6 +252,7 @@ def build_product(
         revision=revision,
         version=version,
         status=status,
+        contract_release_version=evaluation.contract_release_version,
         output=output,
         qualified_ranges=[{**r, "kind": "qualified"} for r in qualified]
         + [{**r, "kind": "maintenance"} for r in excused],

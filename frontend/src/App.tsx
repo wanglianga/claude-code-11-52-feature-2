@@ -10,6 +10,7 @@ import ImpactPage from './pages/Impact'
 import IncidentsPage from './pages/Incidents'
 import SimulatorPage from './pages/Simulator'
 import AcceptancePage from './pages/Acceptance'
+import SemanticsPage from './pages/Semantics'
 
 type User = { display_name: string; role: string }
 
@@ -39,6 +40,7 @@ export default function App() {
             <Route path="/impact" element={<ImpactPage />} />
             <Route path="/incidents" element={<IncidentsPage />} />
             <Route path="/simulator" element={<SimulatorPage />} />
+            <Route path="/semantics" element={<SemanticsPage />} />
             <Route path="/acceptance" element={<AcceptancePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

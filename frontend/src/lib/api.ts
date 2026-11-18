@@ -130,3 +130,24 @@ export const SLOT_LABEL: Record<string, string> = {
   verification: '核验缺口',
   beyond_cutoff: '未到截止',
 }
+
+export const SEMANTICS_LABEL: Record<string, string> = {
+  cumulative: '累计表码',
+  interval: '区间读数',
+  instant: '瞬时量',
+}
+
+export const QUARANTINE_REASON_LABEL: Record<string, string> = {
+  missing_contract: '来源声明缺失',
+  contract_conflict: '契约同期冲突',
+  dimension_mismatch: '量纲不兼容',
+  cumulative_reset: '累计读数回退',
+  cumulative_baseline: '缺少可衔接基线',
+  bridge_gap: '跨未覆盖槽位',
+  interval_reaccumulation: '区间被二次累计',
+  unit_factor_unknown: '换算因子/方向缺失',
+  sign_feedback_unverified: '回送含义不可验证',
+  instant_interval_unsupported: '间隔不支持积分',
+  multiplier_unresolved: '倍率引用无法解析',
+  numeric_unparseable: '数值不可解析',
+}

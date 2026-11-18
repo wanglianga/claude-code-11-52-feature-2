@@ -20,6 +20,33 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 from .timeutil import utcnow
 
+# 语义口径（reading_semantics）取值：
+#   cumulative 累计表码（只能在可确认的连续读数之间求差）
+#   interval   区间读数（已经是区间用量，不得再次累计）
+#   instant    瞬时量（如功率 kW，只能按可支持积分的间隔换算，不能与电量直接相加）
+SEMANTIC_CUMULATIVE = "cumulative"
+SEMANTIC_INTERVAL = "interval"
+SEMANTIC_INSTANT = "instant"
+SEMANTIC_VALUES = (SEMANTIC_CUMULATIVE, SEMANTIC_INTERVAL, SEMANTIC_INSTANT)
+
+# 标准化结论
+COMPILE_STANDARD = "standard"  # 证据完整，已转为标准区间事实
+COMPILE_QUARANTINED = "quarantined"  # 无法证明语义，隔离待核（不填零）
+
+# 待核原因代码（quarantine reason）
+Q_NO_CONTRACT = "missing_contract"  # 来源声明缺失，没有适用契约
+Q_CONTRACT_CONFLICT = "contract_conflict"  # 同一有效期存在两个冲突契约
+Q_DIMENSION = "dimension_mismatch"  # 量纲不兼容（如 kW 与 kWh 混入）
+Q_CUMULATIVE_RESET = "cumulative_reset"  # 累计读数回退且无连续基线
+Q_CUMULATIVE_BASELINE = "cumulative_baseline"  # 累计表缺少可衔接基线
+Q_BRIDGE_GAP = "bridge_gap"  # 表码差跨过未覆盖槽位
+Q_INTERVAL_REACCUM = "interval_reaccumulation"  # 区间读数被当作累计再次求差
+Q_UNIT_FACTOR = "unit_factor_unknown"  # 单位换算缺少明确因子/方向
+Q_SIGN_FEEDBACK = "sign_feedback_unverified"  # 负向符号没有可验证的回送含义
+Q_INSTANT_INTERVAL = "instant_interval_unsupported"  # 读数间隔不支持功率积分
+Q_MULTIPLIER = "multiplier_unresolved"  # 倍率引用无法解析
+Q_NUMERIC = "numeric_unparseable"  # 数值本身不可解析
+
 
 class User(Base):
     __tablename__ = "users"
@@ -171,6 +198,8 @@ class HealthEvaluation(Base):
     confirmable: Mapped[bool] = mapped_column(Boolean, default=False)
     max_lateness_minutes: Mapped[int] = mapped_column(Integer, default=0)
     recompute_count: Mapped[int] = mapped_column(Integer, default=1)
+    # 本次评估锁定的语义契约解释版本（历史评估可按该版本复演解释）
+    contract_release_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -253,6 +282,8 @@ class ProductRun(Base):
     revision: Mapped[int] = mapped_column(Integer, default=0)
     version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(32))
+    # 产品发布固定引用的语义契约解释版本；所有消费者必须引用同一解释版本
+    contract_release_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     qualified_ranges: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     evaluation_ids: Mapped[list[int]] = mapped_column(JSONB, default=list)
@@ -388,3 +419,197 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(64))
     target: Mapped[str] = mapped_column(String(128), default="")
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+
+# ============================================================
+# 语义契约治理：契约登记 → 原始受理 → 标准化事实 / 待核隔离 → 产品发布
+# 五者通过“契约版本号 + 解释版本号”串联，历史产品永远可按其锁定版本复演。
+# ============================================================
+
+
+class SemanticContract(Base):
+    """表计数据语义契约（按来源版本登记，带有效期）。
+
+    一条契约完整描述一个来源版本在有效期内如何解释其读数：计量对象、物理量、
+    单位、累计/区间/瞬时含义、采样代表时段、符号方向、倍率引用与有效期。
+    契约只追加、不就地改写；更正通过关闭旧契约有效期 + 登记新版本实现。
+    """
+
+    __tablename__ = "semantic_contracts"
+    __table_args__ = (
+        Index("ix_contract_meter_valid", "meter_id", "valid_from", "valid_to"),
+        Index("ix_contract_source_version", "source_code", "source_version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), index=True)
+    # 来源版本（厂商/协议批次标识），同一来源版本只允许一种已批准解释
+    source_code: Mapped[str] = mapped_column(String(64))
+    source_version: Mapped[str] = mapped_column(String(64))
+    # 计量对象（如“研发楼 1# 进线有功电量”）与物理量（electricity/water/steam/pv）
+    measurement_object: Mapped[str] = mapped_column(String(128))
+    physical_quantity: Mapped[str] = mapped_column(String(32))
+    # 原始读数单位与目标标准单位
+    raw_unit: Mapped[str] = mapped_column(String(32))
+    standard_unit: Mapped[str] = mapped_column(String(32))
+    # 累计 / 区间 / 瞬时
+    reading_semantics: Mapped[str] = mapped_column(String(16))
+    # 采样代表时段（分钟）：区间读数覆盖的时长；瞬时量的积分代表时段
+    representative_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    # 符号方向：bidirectional 允许负值（需可验证回送含义）；forward 仅正向
+    sign_direction: Mapped[str] = mapped_column(String(32), default="forward")
+    # 负向符号的可验证回送含义（sign_direction=bidirectional 时必填，如“反向馈送发电”）
+    feedback_meaning: Mapped[str] = mapped_column(Text, default="")
+    # 倍率引用（指向 meter.multiplier 或显式因子）
+    multiplier_ref: Mapped[str] = mapped_column(String(64), default="meter.multiplier")
+    multiplier_factor: Mapped[float] = mapped_column(Float, default=1.0)
+    # 单位换算因子与方向：standard_value = raw_value * unit_factor（含方向）
+    unit_factor: Mapped[float] = mapped_column(Float, default=1.0)
+    unit_factor_evidence: Mapped[str] = mapped_column(Text, default="")
+    # 有效期：窗口在交界处按边界拆分，不能用当前配置解释整天
+    valid_from: Mapped[datetime] = mapped_column(DateTime)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active | superseded
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="ops")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    meter: Mapped[Meter] = relationship()
+
+
+class ContractRelease(Base):
+    """契约发布/锁定版本。
+
+    每次发布把当前所有有效契约固化为一个不可变的契约版本号；产品运行固定引用
+    某个发布版本，新契约只影响新运行，历史产品仍按其引用版本复演解释。
+    """
+
+    __tablename__ = "contract_releases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True)
+    status: Mapped[str] = mapped_column(String(16), default="locked")  # locked | drafted
+    contract_ids: Mapped[list[int]] = mapped_column(JSONB, default=list)
+    # 契约内容指纹，用于判断重放时解释是否发生变化
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="ops")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RawReading(Base):
+    """原始受理（不可变原载荷）。
+
+    保留厂商上报的原始报文与来源版本；标准化在其之上做投影，不修改原始记录。
+    同一原记录在同一解释版本下只有一种已批准解释（unique 约束兜底）。
+    """
+
+    __tablename__ = "raw_readings"
+    __table_args__ = (
+        UniqueConstraint(
+            "meter_id", "slot_start", "source_version",
+            name="uq_raw_reading_identity",
+        ),
+        Index("ix_raw_meter_slot", "meter_id", "slot_start"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"))
+    slot_start: Mapped[datetime] = mapped_column(DateTime)
+    slot_end: Mapped[datetime] = mapped_column(DateTime)
+    raw_value: Mapped[float] = mapped_column(Float)
+    raw_unit: Mapped[str] = mapped_column(String(32), default="")
+    source_code: Mapped[str] = mapped_column(String(64))
+    source_version: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    received_at: Mapped[datetime] = mapped_column(DateTime)
+    # 受理时解析出的样本 id（与既有 samples 链路对应，可空）
+    sample_id: Mapped[int | None] = mapped_column(ForeignKey("samples.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    meter: Mapped[Meter] = relationship()
+
+
+class StandardIntervalFact(Base):
+    """标准区间事实（不可变）。
+
+    只有证据完整的读数才会被编译器转换为标准区间事实：统一到标准单位、统一为
+    “区间用量”口径，记录完整换算步骤、来源契约与解释版本。同一原记录在同一
+    解释版本下唯一。
+    """
+
+    __tablename__ = "standard_interval_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_reading_id", "contract_release_version",
+            name="uq_standard_raw_release",
+        ),
+        Index("ix_standard_meter_slot", "meter_id", "slot_start"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"))
+    building_code: Mapped[str] = mapped_column(String(32))
+    raw_reading_id: Mapped[int] = mapped_column(ForeignKey("raw_readings.id"))
+    contract_id: Mapped[int] = mapped_column(ForeignKey("semantic_contracts.id"))
+    # 解释版本：固定引用某次契约发布，历史产品按此复演
+    contract_release_version: Mapped[int] = mapped_column(Integer, index=True)
+    slot_start: Mapped[datetime] = mapped_column(DateTime)
+    slot_end: Mapped[datetime] = mapped_column(DateTime)
+    physical_quantity: Mapped[str] = mapped_column(String(32))
+    standard_unit: Mapped[str] = mapped_column(String(32))
+    # 标准化后的区间用量（标准单位）
+    standard_value: Mapped[float] = mapped_column(Float)
+    # 来源语义与逐步换算证据
+    source_semantics: Mapped[str] = mapped_column(String(16))
+    conversion_steps: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    # 适用契约在该槽位是否处于有效期交界处拆分而来
+    boundary_split: Mapped[bool] = mapped_column(Boolean, default=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    meter: Mapped[Meter] = relationship()
+    contract: Mapped[SemanticContract] = relationship()
+    raw_reading: Mapped[RawReading] = relationship()
+
+
+class QuarantineRecord(Base):
+    """待核隔离槽位（质量槽位）。
+
+    无法证明语义的读数不填零、不进标准事实，隔离为“待解释”，并阻断确认版。
+    记录隔离原因、命中的契约（或缺失/冲突情况）与解释版本，供后续契约更正后重放。
+    """
+
+    __tablename__ = "quarantine_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_reading_id", "contract_release_version",
+            name="uq_quarantine_raw_release",
+        ),
+        Index("ix_quarantine_meter_slot", "meter_id", "slot_start"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"))
+    building_code: Mapped[str] = mapped_column(String(32))
+    raw_reading_id: Mapped[int | None] = mapped_column(
+        ForeignKey("raw_readings.id"), nullable=True
+    )
+    # 可能命中 0 个（缺失）或多个（冲突）契约
+    contract_ids: Mapped[list[int]] = mapped_column(JSONB, default=list)
+    contract_release_version: Mapped[int] = mapped_column(Integer, index=True)
+    slot_start: Mapped[datetime] = mapped_column(DateTime)
+    slot_end: Mapped[datetime] = mapped_column(DateTime)
+    physical_quantity: Mapped[str] = mapped_column(String(32), default="")
+    reason_code: Mapped[str] = mapped_column(String(48))
+    reason_detail: Mapped[str] = mapped_column(Text, default="")
+    # 数值可解析但语义不可用：明确区分“数值可解析”与“可用于能耗产品”
+    numeric_parseable: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | resolved
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolved_by_fact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("standard_interval_facts.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    meter: Mapped[Meter] = relationship()

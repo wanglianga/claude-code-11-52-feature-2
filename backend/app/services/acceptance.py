@@ -48,6 +48,14 @@ W1 = datetime(2026, 11, 10, 12, 0)
 
 def reset_demo_state(db: Session) -> None:
     """Return the demo to a clean reproducible baseline before replaying acceptance."""
+    # 语义契约探针与主叙事共享 electricity/water 来源，先清理，避免待核探针污染主验收的合格判定
+    try:
+        from .semantic_demo import reset_semantic_demo
+
+        reset_semantic_demo(db)
+    except Exception:  # pragma: no cover - 语义表尚未建表时的保护
+        pass
+
     for model in (
         ConsumerImpact,
         RecoveryCheck,

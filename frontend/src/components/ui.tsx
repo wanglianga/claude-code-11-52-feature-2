@@ -22,6 +22,7 @@ const NAV = [
   {
     group: '验证',
     items: [
+      { to: '/semantics', label: '语义契约', ico: '§' },
       { to: '/simulator', label: '模拟与验收', ico: '▶' },
       { to: '/acceptance', label: '验收报告', ico: '✓' },
     ],
